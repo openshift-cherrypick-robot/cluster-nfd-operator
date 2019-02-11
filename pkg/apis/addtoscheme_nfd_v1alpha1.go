@@ -1,7 +1,7 @@
 package apis
 
 import (
-	"github.com/openshift/cluster-nfd-operator/pkg/apis/nfd/v1alpha1"
+	"github.com/openshift/nfd-operator/pkg/apis/nfd/v1alpha1"
 )
 
 func init() {

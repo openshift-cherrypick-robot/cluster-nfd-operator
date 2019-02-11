@@ -55,6 +55,7 @@ const (
 	CRManifestOpt         = "cr-manifest"
 	ProxyImageOpt         = "proxy-image"
 	ProxyPullPolicyOpt    = "proxy-pull-policy"
+	CRDsDirOpt            = "crds-dir"
 	VerboseOpt            = "verbose"
 )
 
@@ -195,11 +196,15 @@ func ScorecardTests(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Println("Checking that operator actions are reflected in status")
-		err = checkStatusUpdate(runtimeClient, obj)
-		if err != nil {
-			return err
-		}
+		// This test is far too inconsistent and unreliable to be meaningful,
+		// so it has been disabled
+		/*
+			fmt.Println("Checking that operator actions are reflected in status")
+			err = checkStatusUpdate(runtimeClient, obj)
+			if err != nil {
+				return err
+			}
+		*/
 		fmt.Println("Checking that writing into CRs has an effect")
 		logs, err := writingIntoCRsHasEffect(obj)
 		if err != nil {
@@ -229,6 +234,10 @@ func ScorecardTests(cmd *cobra.Command, args []string) error {
 			csv = o
 		default:
 			return fmt.Errorf("provided yaml file not of ClusterServiceVersion type")
+		}
+		fmt.Println("Checking if all CRDs have validation")
+		if err := crdsHaveValidation(viper.GetString(CRDsDirOpt), runtimeClient, obj); err != nil {
+			return err
 		}
 		fmt.Println("Checking for CRD resources")
 		crdsHaveResources(csv)
@@ -291,7 +300,7 @@ func initConfig() error {
 	if err := viper.ReadInConfig(); err == nil {
 		log.Info("Using config file: ", viper.ConfigFileUsed())
 	} else {
-		log.Warn("Could not load config file; using only flags")
+		log.Warn("Could not load config file; using flags")
 	}
 	return nil
 }

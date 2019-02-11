@@ -1,7 +1,7 @@
 package controller
 
 import (
-	"github.com/openshift/cluster-nfd-operator/pkg/controller/nodefeaturediscovery"
+	"github.com/openshift/nfd-operator/pkg/controller/nodefeaturediscovery"
 )
 
 func init() {
