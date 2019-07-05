@@ -3,20 +3,24 @@
 package e2e
 
 import (
-	"context"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
-	configv1 "github.com/openshift/api/config/v1"
-	configv1client "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
-	"github.com/openshift/cluster-nfd-operator/pkg/apis"
-	tunedv1 "github.com/openshift/cluster-nfd-operator/pkg/apis/tuned/v1"
-	ntoclient "github.com/openshift/cluster-node-tuning-operator/pkg/client"
-	ntoconfig "github.com/openshift/cluster-node-tuning-operator/pkg/config"
-	framework "github.com/operator-framework/operator-sdk/pkg/test"
+	nfdv1alpha1 "github.com/openshift/cluster-nfd-operator/pkg/apis/nfd/v1alpha1"
+	nfdclient "github.com/openshift/cluster-nfd-operator/pkg/client"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	crdc "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/runtime/serializer/json"
+	"k8s.io/client-go/kubernetes/scheme"
 )
 
 const (
@@ -24,98 +28,248 @@ const (
 	apiTimeout        = 10 * time.Second
 )
 
-func TestOperatorAvailable(t *testing.T) {
-	cfgv1client, err := ntoclient.GetCfgV1Client()
+type assetsFromFile []byte
+
+var manifests []assetsFromFile
+
+func TestCreateOperator(t *testing.T) {
+
+	clientSet, err := nfdclient.GetClientSet()
+	if clientSet == nil {
+		t.Errorf("failed to get a clientSet: %v", err)
+	}
+
+	cfgv1client, err := nfdclient.GetCfgV1Client()
 	if cfgv1client == nil {
-		t.Errorf("failed to get a client: %v", err)
+		t.Errorf("failed to get a cfgv1client: %v", err)
 	}
 
-	t.Log("=== Wait for tuned Cluster Operator to be available")
-	if err := waitForTunedOperatorAvailable(t, cfgv1client, deploymentTimeout); err != nil {
-		t.Errorf("failed to wait for tuned Cluster Operator to be available: %s", err)
-	}
-	t.Logf("tuned Cluster Operator is available")
-}
-
-func TestDefaultTunedExists(t *testing.T) {
-	ctx, client, ns := prepareTest(t)
-	defer ctx.Cleanup()
-
-	t.Log("=== Wait for default Tuned CR to exist")
-	if err := waitForTunedCR(t, client, deploymentTimeout); err != nil {
-		t.Errorf("failed to wait for default Tuned CR to exist: %s", err)
-	}
-	t.Logf("tuned CR in %s/default exists", ns)
-}
-
-func prepareTest(t *testing.T) (ctx *framework.TestCtx, client framework.FrameworkClient, namespace string) {
-	tunedList := &tunedv1.TunedList{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Tuned",
-			APIVersion: tunedv1.SchemeGroupVersion.String(),
-		},
-	}
-	err := framework.AddToFrameworkScheme(apis.AddToScheme, tunedList)
-	if err != nil {
-		t.Fatalf("failed to add custom resource scheme to framework: %v", err)
+	apiclient, err := nfdclient.GetApiClient()
+	if apiclient == nil {
+		t.Errorf("failed to get a apiclient: %v", err)
 	}
 
-	ctx = framework.NewTestCtx(t)
-	ns, err := ctx.GetNamespace()
-	if err != nil {
-		t.Fatalf("failed to initialize namespace: %v", err)
-	}
-	return ctx, framework.Global.Client, ns
-}
-
-func waitForTunedCR(t *testing.T, client framework.FrameworkClient, timeout time.Duration) error {
-	cr := &tunedv1.Tuned{}
-	err := wait.PollImmediate(time.Second, timeout, func() (done bool, err error) {
-		ctx, cancel := testContext()
-		defer cancel()
-		err = client.Get(ctx, types.NamespacedName{Name: "default", Namespace: ntoconfig.OperatorNamespace()}, cr)
-		if err != nil {
-			return false, err
-		}
-
-		return true, nil
-	})
-	if err != nil {
-		t.Logf("failed to wait for default Tuned CR to exist")
-		t.Logf("last known version: %+v", cr)
+	crdclient, err := nfdclient.NewClient()
+	if crdclient == nil {
+		t.Errorf("failed to get a crdclient: %v", err)
 	}
 
-	return err
-}
+	path := "manifests"
+	namespace := "openshift-nfd-operator"
 
-func waitForTunedOperatorAvailable(t *testing.T, cfgv1client *configv1client.ConfigV1Client, timeout time.Duration) error {
-	clusterOperatorName := ntoconfig.OperatorName()
+	manifests := getAssetsFrom(path)
 
-	co := &configv1.ClusterOperator{}
+	s := json.NewYAMLSerializer(json.DefaultMetaFactory, scheme.Scheme,
+		scheme.Scheme)
+	reg, _ := regexp.Compile(`\b(\w*kind:\w*)\B.*\b`)
 
-	err := wait.PollImmediate(time.Second, timeout, func() (done bool, err error) {
-		co, err = cfgv1client.ClusterOperators().Get(clusterOperatorName, metav1.GetOptions{})
-		if err != nil {
-			return false, nil
-		}
+	for _, m := range manifests {
+		kind := reg.FindString(string(m))
+		slce := strings.Split(kind, ":")
+		kind = strings.TrimSpace(slce[1])
 
-		for _, cond := range co.Status.Conditions {
-			if cond.Type == configv1.OperatorAvailable &&
-				cond.Status == configv1.ConditionTrue {
-				return true, nil
+		switch kind {
+		case "Namespace":
+			var res corev1.Namespace
+			t.Logf("Resource: Kind %s", kind)
+			_, _, err := s.Decode(m, nil, &res)
+
+			client := clientSet.CoreV1().Namespaces()
+
+			
+
+			_, err = client.Get(res.GetName(), metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				_, err = client.Create(&res)
+				if err != nil {
+					t.Errorf("Creating %s %s object failed", kind, res.GetName())
+				}
 			}
+			if err != nil {
+				t.Errorf("Retrieving %s %s object failed", kind, res.GetName())
+			}
+
+			_, err = client.Update(&res)
+			if err != nil {
+				t.Errorf("Updating %s %s object failed", kind, res.GetName())
+			}
+
+		case "ServiceAccount":
+			var res corev1.ServiceAccount
+			t.Logf("Resource: Kind %s", kind)
+			_, _, err := s.Decode(m, nil, &res)
+
+			client := clientSet.CoreV1().ServiceAccounts(namespace)
+
+			_, err = client.Get(res.GetName(), metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				_, err = client.Create(&res)
+				if err != nil {
+					t.Errorf("Creating %s %s object failed", kind, res.GetName())
+				}
+			}
+			if err != nil {
+				t.Errorf("Retrieving %s %s object failed", kind, res.GetName())
+			}
+
+			_, err = client.Update(&res)
+			if err != nil {
+				t.Errorf("Updating %s %s object failed", kind, res.GetName())
+			}
+
+		case "ClusterRole":
+			var res rbacv1.ClusterRole
+			t.Logf("Resource: Kind %s", kind)
+			_, _, err := s.Decode(m, nil, &res)
+
+			client := clientSet.RbacV1().ClusterRoles()
+
+			_, err = client.Get(res.GetName(), metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				_, err = client.Create(&res)
+				if err != nil {
+					t.Errorf("Creating %s %s object failed", kind, res.GetName())
+				}
+			}
+			if err != nil {
+				t.Errorf("Retrieving %s %s object failed", kind, res.GetName())
+			}
+
+			_, err = client.Update(&res)
+			if err != nil {
+				t.Errorf("Updating %s %s object failed", kind, res.GetName())
+			}
+		case "ClusterRoleBinding":
+			var res rbacv1.ClusterRoleBinding
+			t.Logf("Resource: Kind %s", kind)
+			_, _, err := s.Decode(m, nil, &res)
+			client := clientSet.RbacV1().ClusterRoleBindings()
+
+			_, err = client.Get(res.GetName(), metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				_, err = client.Create(&res)
+				if err != nil {
+					t.Errorf("Creating %s %s object failed", kind, res.GetName())
+				}
+			}
+			if err != nil {
+				t.Errorf("Retrieving %s %s object failed", kind, res.GetName())
+			}
+
+			_, err = client.Update(&res)
+			if err != nil {
+				t.Errorf("Updating %s %s object failed", kind, res.GetName())
+			}
+		case "CustomResourceDefinition":
+			var res crdc.CustomResourceDefinition
+			t.Logf("Resource: Kind %s", kind)
+			_, _, err := s.Decode(m, nil, &res)
+
+			t.Logf("CRD: %s", string(m))
+
+			client := apiclient.ApiextensionsV1beta1().CustomResourceDefinitions()
+
+			existing, err := client.Get(res.GetName(), metav1.GetOptions{})
+
+			t.Logf("EXISTING: %s", string(existing.GetName()))
+
+			if apierrors.IsNotFound(err) {
+				_, err = client.Create(&res)
+				if err != nil {
+					t.Errorf("Creating %s %s object failed", kind, res.GetName())
+				}
+				t.Logf("Resource: Kind %s created", kind)
+			}
+			if err != nil {
+				t.Errorf("Retrieving %s %s object failed", kind, res.GetName())
+			}
+
+			required := res.DeepCopy()
+			required.ResourceVersion = existing.ResourceVersion
+
+			_, err = client.Update(required)
+			if err != nil {
+				t.Errorf("Updating %s %s object failed: %s", kind, res.GetName(), err)
+			}
+			t.Logf("Resource: Kind %s updated", kind)
+
+		case "Deployment":
+			var res appsv1.Deployment
+			t.Logf("Resource: Kind %s", kind)
+			_, _, err := s.Decode(m, nil, &res)
+
+			client := clientSet.AppsV1().Deployments(namespace)
+
+			_, err = client.Get(res.GetName(), metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				_, err = client.Create(&res)
+				if err != nil {
+					t.Errorf("Creating %s %s object failed", kind, res.GetName())
+				}
+			}
+			if err != nil {
+				t.Errorf("Retrieving %s %s object failed", kind, res.GetName())
+			}
+
+			_, err = client.Update(&res)
+			if err != nil {
+				t.Errorf("Updating %s %s object failed", kind, res.GetName())
+			}
+
+		case "NodeFeatureDiscovery!!":
+			var res nfdv1alpha1.NodeFeatureDiscovery
+			t.Logf("Resource: Kind %s", kind)
+			_, _, err := s.Decode(m, nil, &res)
+
+			existing, err := crdclient.NodeFeatureDiscoveries("openshift-nfd").Get("nfd-master-server")
+			if apierrors.IsNotFound(err) {
+				_, err = crdclient.NodeFeatureDiscoveries("openshift-nfd").Create(&res)
+				if err != nil {
+					t.Errorf("Creating %s %s object failed", kind, res.GetName())
+				}
+			}
+			if err != nil {
+				t.Errorf("Retrieving %s %s object failed", kind, res.GetName())
+			}
+
+			required := res.DeepCopy()
+			required.ResourceVersion = existing.ResourceVersion
+
+			//			_, err = crdclient.NodeFeatureDiscoveries("openshift-nfd").Update(required)
+			//			if err != nil {
+			//				t.Errorf("Updating %s %s object failed", kind, res.GetName())
+			//			}
+		default:
+			t.Errorf("Unknown Resource: Kind %s", kind)
 		}
-
-		return false, nil
-	})
-	if err != nil {
-		t.Logf("failed to wait for tuned Cluster Operator to be available")
-		t.Logf("last known version: %+v", co)
 	}
-
-	return err
 }
 
-func testContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), apiTimeout)
+func filePathWalkDir(root string) ([]string, error) {
+	var files []string
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if !info.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	})
+	return files, err
+}
+
+func getAssetsFrom(path string) []assetsFromFile {
+
+	manifests := []assetsFromFile{}
+	assets := path
+	files, err := filePathWalkDir(assets)
+	if err != nil {
+		panic(err)
+	}
+	for _, file := range files {
+		buffer, err := ioutil.ReadFile(file)
+		if err != nil {
+			panic(err)
+		}
+		manifests = append(manifests, buffer)
+	}
+	return manifests
 }
